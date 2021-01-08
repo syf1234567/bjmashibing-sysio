@@ -15,20 +15,23 @@ import org.junit.Test;
 
 import java.io.*;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
+
 public class MyRPCTest {
     @Test
     public void startServer() {
-        NioEventLoopGroup boss = new NioEventLoopGroup(1);
+        NioEventLoopGroup boss = new NioEventLoopGroup(20);
         NioEventLoopGroup worker = boss;
         ServerBootstrap sbs = new ServerBootstrap();
         ChannelFuture bind = sbs.group(boss, worker)
@@ -58,8 +61,18 @@ public class MyRPCTest {
         for (int i = 0; i < size; i++) {
             threads[i] = new Thread(() -> {
                 Car car = proxyGet(Car.class);
-                car.ooxx("hello" + num.incrementAndGet());
+                String arg = "hello" + num.incrementAndGet();
+                String res = car.ooxx(arg);
+                System.out.println("client over msg:" + res + "src arg:" + arg);
             });
+        }
+        for (Thread thread : threads) {
+            thread.start();
+        }
+        try {
+            System.in.read();
+        } catch (IOException e) {
+            e.printStackTrace();
         }
         /*new Thread(() -> {
             startServer();
@@ -111,12 +124,14 @@ public class MyRPCTest {
 
                 CountDownLatch countDownLatch = new CountDownLatch(1);
                 long id = header.getRequestID();
-                ResponseHandler.addCallBack(id, new Runnable() {
+                /*ResponseMappingCallback.addCallBack(id, new Runnable() {
                     @Override
                     public void run() {
                         countDownLatch.countDown();
                     }
-                });
+                });*/
+                CompletableFuture<String> res = new CompletableFuture<>();
+                ResponseMappingCallback.addCallBack(id, res);
                 byteBuf.writeBytes(msgHeader);
                 byteBuf.writeBytes(msgBody);
                 clientChannel.writeAndFlush(msgHeader);
@@ -127,7 +142,7 @@ public class MyRPCTest {
 
                 //5.?如果从IO,未来回来了，怎么将代码执行到这里
                 //(睡眠/回调，如何让线程停下来?你还能让他继续...)
-                return null;
+                return res.get();//阻塞的
             }
         });
     }
@@ -223,15 +238,25 @@ class ServerDecode extends ByteToMessageDecoder {
             ObjectInputStream oin = new ObjectInputStream(in);
             MyHeader header = (MyHeader) oin.readObject();
             System.out.println("server response @id:" + header.getRequestID());
+            //DECODE在2个方向都使用
+            //通信的协议
             if (buf.readableBytes() >= header.getDataLen()) {
                 buf.readBytes(110);
                 byte[] data = new byte[(int) header.getDataLen()];
                 buf.readBytes(data);
                 ByteArrayInputStream din = new ByteArrayInputStream(data);
                 ObjectInputStream doin = new ObjectInputStream(din);
-                MyContent content = (MyContent) doin.readObject();
-                System.out.println(content.getName());
-                out.add(new Packmsg(header, content));
+
+                if (header.getFlag() == 0x14141414) {
+                    MyContent content = (MyContent) doin.readObject();
+                    System.out.println(content.getName());
+                    out.add(new Packmsg(header, content));
+                } else if (header.getFlag() == 0x14141424) {
+                    MyContent content = (MyContent) doin.readObject();
+                    System.out.println(content.getName());
+                    out.add(new Packmsg(header, content));
+                }
+
             } else {
                 break;
             }
@@ -252,17 +277,17 @@ class ClientPool {
     }
 }
 
-class ResponseHandler {
-    static ConcurrentHashMap<Long, Runnable> mapping = new ConcurrentHashMap<>();
+class ResponseMappingCallback {
+    static ConcurrentHashMap<Long, CompletableFuture> mapping = new ConcurrentHashMap<>();
 
-    public static void addCallBack(long requestID, Runnable cb) {
+    public static void addCallBack(long requestID, CompletableFuture cb) {
         mapping.putIfAbsent(requestID, cb);
     }
 
-    public static void runCallBack(long requestID) {
-        Runnable runnable = mapping.get(requestID);
-        runnable.run();
-        removeCB(requestID);
+    public static void runCallBack(Packmsg msg) {
+        CompletableFuture cf = mapping.get(msg.header.getRequestID());
+        cf.complete(msg.getContent().getRes());
+        removeCB(msg.header.getRequestID());
     }
 
     private static void removeCB(long requestID) {
@@ -274,8 +299,9 @@ class ClientResponses extends ChannelInboundHandlerAdapter {
     //consumer
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        ByteBuf buf = (ByteBuf) msg;
-        if (buf.readableBytes() >= 110) {
+        Packmsg responsepkg = (Packmsg) msg;
+        ResponseMappingCallback.runCallBack(responsepkg);
+        /*if (buf.readableBytes() >= 110) {
             byte[] bytes = new byte[110];
             buf.readBytes(bytes);
             ByteArrayInputStream in = new ByteArrayInputStream(bytes);
@@ -284,15 +310,15 @@ class ClientResponses extends ChannelInboundHandlerAdapter {
             System.out.println("client response @ id" + header.getRequestID());
             //TODO:
             ResponseHandler.runCallBack(header.requestID);
-            /*if (buf.readableBytes() >= header.getDataLen()) {
+            *//*if (buf.readableBytes() >= header.getDataLen()) {
                 byte[] data = new byte[(int) header.getDataLen()];
                 buf.readBytes(data);
                 ByteArrayInputStream din = new ByteArrayInputStream(data);
                 ObjectInputStream doin = new ObjectInputStream(din);
                 MyContent content = (MyContent) doin.readObject();
                 System.out.println(content.getName());
-            }*/
-        }
+            }*//*
+        }*/
         super.channelRead(ctx, msg);
     }
 }
@@ -313,17 +339,27 @@ class ServerRequestHandler extends ChannelInboundHandlerAdapter {
         String ioThreadName = Thread.currentThread().getName();
         //1.直接在当前方法   处理IO和业务和返回
         //2.使用netty自己的eventloop来处理业务及返回
-        ctx.executor().execute(new Runnable(){
+        //3.自己创建线程池
+        //ctx.executor().execute(new Runnable(){
+        ctx.executor().parent().next().execute(new Runnable() {
             @Override
-            public void run(){
+            public void run() {
                 String execThreadName = Thread.currentThread().getName();
                 MyContent content = new MyContent();
-                content.setRes("");
+                String s = "io thread:" + ioThreadName + " exec thread:" + execThreadName + "from args:" + requestPkg.content.getArgs()[0];
+                content.setRes(s);
+                byte[] contentByte = SerDerUtil.ser(content);
+
                 MyHeader resHeader = new MyHeader();
-                resHeader.setRequestID(requestPkg.header.getRequestID()):
+                resHeader.setRequestID(requestPkg.header.getRequestID());
                 resHeader.setFlag(0x14141414);
-                resHeader.setDataLen();
-                ctx.writeAndFlush(ooxx);
+                resHeader.setDataLen(contentByte.length);
+
+                byte[] headerByte = SerDerUtil.ser(resHeader);
+                ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(headerByte.length + contentByte.length);
+                byteBuf.writeBytes(headerByte);
+                byteBuf.writeBytes(contentByte);
+                //   ctx.writeAndFlush(byteBuf);
             }
         });
 
@@ -377,10 +413,18 @@ class MyContent implements Serializable {
 }
 
 interface Car {
-    void ooxx(String msg);
+    String ooxx(String msg);
 }
 
 interface Fly {
     void ooxx(String msg);
 }
 
+class MyCar implements Car {
+
+    @Override
+    public String ooxx(String msg) {
+        System.out.println("server get client arg:" + msg);
+        return "server res" + msg;
+    }
+}
