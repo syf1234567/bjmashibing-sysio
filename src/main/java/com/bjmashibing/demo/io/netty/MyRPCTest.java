@@ -31,6 +31,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class MyRPCTest {
     @Test
     public void startServer() {
+        MyCar car = new MyCar();
+        MyFly fly = new MyFly();
+        Dispatcher dis = new Dispatcher();
+        dis.register(Car.class.getName(), car);
+        dis.register(Fly.class.getName(), fly);
+
         NioEventLoopGroup boss = new NioEventLoopGroup(20);
         NioEventLoopGroup worker = boss;
         ServerBootstrap sbs = new ServerBootstrap();
@@ -42,7 +48,7 @@ public class MyRPCTest {
                         System.out.println("server accept client port:" + ch.remoteAddress().getPort());
                         ChannelPipeline p = ch.pipeline();
                         p.addLast(new ServerDecode());
-                        p.addLast(new ServerRequestHandler());
+                        p.addLast(new ServerRequestHandler(dis));
                     }
                 }).bind(new InetSocketAddress("localhost", 9090));
         try {
@@ -324,6 +330,13 @@ class ClientResponses extends ChannelInboundHandlerAdapter {
 }
 
 class ServerRequestHandler extends ChannelInboundHandlerAdapter {
+
+    Dispatcher dis;
+
+    public ServerRequestHandler(Dispatcher dis) {
+        this.dis = dis;
+    }
+
     //provider
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
@@ -344,10 +357,28 @@ class ServerRequestHandler extends ChannelInboundHandlerAdapter {
         ctx.executor().parent().next().execute(new Runnable() {
             @Override
             public void run() {
-                String execThreadName = Thread.currentThread().getName();
+
+                String serviceName = requestPkg.content.getName();
+                String method = requestPkg.content.getMethodName();
+                Object c = dis.get(serviceName);
+                Class<?> clazz = c.getClass();
+                Object res = null;
+                try {
+                    Method m = clazz.getMethod(method, requestPkg.content.parameterTypes);
+                    res = m.invoke(c, requestPkg.content.getArgs());
+
+                } catch (NoSuchMethodException e) {
+                    e.printStackTrace();
+                } catch (IllegalAccessException e) {
+                    e.printStackTrace();
+                } catch (InvocationTargetException e) {
+                    e.printStackTrace();
+                }
+
+                //String execThreadName = Thread.currentThread().getName();
                 MyContent content = new MyContent();
-                String s = "io thread:" + ioThreadName + " exec thread:" + execThreadName + "from args:" + requestPkg.content.getArgs()[0];
-                content.setRes(s);
+                //String s = "io thread:" + ioThreadName + " exec thread:" + execThreadName + "from args:" + requestPkg.content.getArgs()[0];
+                content.setRes((String)res);
                 byte[] contentByte = SerDerUtil.ser(content);
 
                 MyHeader resHeader = new MyHeader();
@@ -412,6 +443,18 @@ class MyContent implements Serializable {
     String res;
 }
 
+class Dispatcher {
+    public static ConcurrentHashMap<String, Object> invokeMap = new ConcurrentHashMap<>();
+
+    public void register(String k, Object obj) {
+        invokeMap.put(k, obj);
+    }
+
+    public Object get(String k) {
+        return invokeMap.get(k);
+    }
+}
+
 interface Car {
     String ooxx(String msg);
 }
@@ -426,5 +469,14 @@ class MyCar implements Car {
     public String ooxx(String msg) {
         System.out.println("server get client arg:" + msg);
         return "server res" + msg;
+    }
+}
+
+class MyFly implements Fly {
+
+    @Override
+    public void ooxx(String msg) {
+        System.out.println("server get client arg:" + msg);
+
     }
 }
